@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 
 from glob import glob
-from six.moves import xrange
+from utils import batch_norm, linear, conv2d_transpose
 
 
 def conv_out_size_same(size, stride):
@@ -24,14 +24,13 @@ def gen_random(model, size):
 
 
 class DCGAN(object):
-    def __init__(self, sess, input_height=108, input_width=108, crop=True, batch_size=64, sample_num=64,
-                 output_height=64, output_width=64, y_dim=None, z_dim=100, gf_dim=64, df_dim=64, gfc_dim=1024,
-                 dfc_dim=1024, c_dim=3, dataset_name='default', max_to_keep=1, input_fname_pattern='*.jpg',
-                 checkpoint_dir='ckpts', sample_dir='samples', out_dir='./out', data_dir='./data'):
+    def __init__(self, sess, image_size=64, is_crop=False, batch_size=64,sample_size=64, lowres=8, z_dim=100,
+                 gf_dim=64, df_dim=64, gfc_dim=1024, dfc_dim=1024, c_dim=3, checkpoint_dir=None, lam=0.1):
         """
 
         :param sess: TensorFlow session
         :param batch_size: the size of batch. Should be specified before training
+        :param lowres: (optional) Low resolution image/mask shrink factor.
         :param gf_dim: (optional)Dimension of generator filters in first conv layer
         :param df_dim: (optional)Dimension of discriminator filters in first conv layer
         :param gfc_dim: (optional)Dimension of gen units for fully connected layer
@@ -39,17 +38,17 @@ class DCGAN(object):
         :param c_dim: (optional) Dimension of image color. For grayscale input, set to 1.
         """
         self.sess = sess
-        self.crop = crop
+        self.is_crop = is_crop
 
         self.batch_size = batch_size
-        self.sample_num = sample_num
+        self.image_size = image_size
+        self.sample_size = sample_size
+        self.image_shape = [image_size, image_size, c_dim]
 
-        self.input_height = input_height
-        self.input_width = input_width
-        self.output_height = output_height
-        self.output_width = output_width
+        self.lowres = lowres
+        self.lowres_size = image_size // lowres
+        self.lowres_shape = [self.lowres_size, self.lowres_size, c_dim]
 
-        self.y_dim = y_dim
         self.z_dim = z_dim
 
         self.gf_dim = gf_dim
@@ -58,10 +57,76 @@ class DCGAN(object):
         self.gfc_dim = gfc_dim
         self.dfc = dfc_dim
 
+        self.lam = lam
+        self.c_dim = c_dim
 
+        self.d_bns = [batch_norm(name='d_bn{}'.format(format(i,)) for i in range(4))]
 
+        log_size = int(math.log(image_size) / math.log(2))
 
+        self.g_bns = [batch_norm(name='g_bn{}'.format(format(i,)) for i in range(log_size))]
 
+        self.checkpoint_dir = checkpoint_dir
+        self.build_model()
+        self.model_name = 'DCGAN.model'
+
+    def build_model(self):
+        pass
+
+    def train(self, config):
+        pass
+
+    def complete(self, config):
+        pass
+
+    def discriminator(self, image, reuse=False):
+        pass
+
+    def generator(self, z):
+        """
+        :param z: the noise vector
+        :return:
+        """
+        with tf.variable_scope("generator") as scope:
+            self.z_, self.h0_w, self.h0_b = linear(z, self.gf_dim*8*4*4, 'g_h0_lin', with_w=True)
+            hs = [None]
+            hs[0] = tf.reshape(self.z_, [-1, 4, 4, self.gf_dim*8])
+            hs[0] = tf.nn.relu(self.g_bns[0](hs[0], self.is_training))
+
+            i = 1
+            depth_mul = 8
+            size = 8
+
+            while size < self.image_size:
+                hs.append(None)
+                name = 'g_h{}'.format(i)
+                hs[i], _, _, conv2d_transpose(hs[i-1], [self.batch_size, size, size, self.gf_dim*depth_mul],
+                                              name=name, with_w=True)
+                hs[i] = tf.nn.relu(self.g_bns[i](hs[i]), self.istraining)
+                i += 1
+                depth_mul //= 2
+                size *= 2
+
+            hs.append(None)
+            name = 'g_h{}'.format(i)
+            hs[i], _, _ = conv2d_transpose(hs[i-1], [self.batch_size, size, size, 3], name=name, with_w=True)
+
+            return tf.nn.tanh(hs[i])
+
+    def save(self, checkpoint_dir, step):
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        self.saver.save(self.sess, os.path.join(checkpoint_dir, self.model_name), global_step=step)
+
+    def load(self, checkpoint_dir):
+        print(" [*] Reading checkpoints...")
+        ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+
+        if ckpt and ckpt.model_checkpoint_path:
+            self.saver.restore(self.sess, ckpt.model_checkpoint_path)
+            return True
+        else:
+            return False
 # def transpose_con2d(x, output_space):
 #     return tf.layers.conv2d_transpose(x, output_space, kernel_size=5, strides=2, padding='same',
 #                                       kernel_initializer=tf.random_normal_initializer(mean=0.0, stddev=0.02))
