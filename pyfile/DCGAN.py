@@ -1,6 +1,10 @@
+# https://github.com/bamos/dcgan-completion.tensorflow/
+
 from __future__ import division
 from __future__ import print_function
 
+import itertools
+import time
 import os
 import math
 import numpy as np
@@ -9,6 +13,15 @@ import tensorflow as tf
 from glob import glob
 from six.moves import xrange
 from utils import batch_norm, linear, conv2d_transpose, lrelu, conv2d, get_image, save_images
+
+
+SUPPORTED_EXTENSIONS = ["png", "jpg", "jpeg"]
+
+
+def dataset_files(root):
+    return list(itertools.chain.from_iterable(
+        glob(os.path.join(root, "*.{}".format(ext))) for ext in SUPPORTED_EXTENSIONS
+    ))
 
 
 def conv_out_size_same(size, stride):
@@ -72,10 +85,156 @@ class DCGAN(object):
         self.model_name = 'DCGAN.model'
 
     def build_model(self):
-        pass
+        self.is_training = tf.placeholder(tf.bool, name='is_training')
+        self.images = tf.placeholder(tf.float32, [None] + self.image_shape, name='real_image')
+        self.lowres_images = tf.reduce_mean(tf.reshape(self.images, [self.batch_size, self.lowres_size, self.lowres,
+                                                                     self.lowres_size, self.lowres, self.c_dim]), [2, 4])
+        self.z = tf.placeholder(tf.float32, [None, self.z_dim], name='z')
+        self.z_sum = tf.summary.histogram('z', self.z)
+
+        self.G = self.generator(self.z)
+
+        self.lowres_G = tf.reduce_mean(tf.reshape(self.G, [self.batch_size, self.lowres_size, self.lowres,
+                                                           self.lowres_size, self.lowres, self.c_dim]), [2, 4])
+
+        self.D, self.D_logits = self.discriminator(self.images)
+
+        self.D_, self.D_logits_ = self.discriminator(self.G, reuse=True)
+
+        self.d_sum = tf.summary.histogram("d", self.D)
+        self.d__sum = tf.summary.histogram('d_', self.D_)
+        self.G_sum = tf.summary.histogram('G', self.G)
+
+        self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits,
+                                                                                  labels=tf.ones_like(self.D)))
+        self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_,
+                                                                                  labels=tf.zeros_like(self.D_)))
+        self.g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_,
+                                                                             labels=tf.ones_like(self.D_)))
+        self.d_loss_real_sum = tf.summary.scalar('d_loss_real', self.d_loss_real)
+        self.d_loss_fake_sum = tf.summary.scalar('d_loss_fake', self.d_loss_fake)
+
+        self.d_loss = self.d_loss_fake + self.d_loss_real
+        self.g_loss_sum = tf.summary.scalar('g_loss', self.g_loss)
+        self.d_loss_sum = tf.summary.scalar('d_loss', self.d_loss)
+
+        t_vars = tf.trainable_variables()
+
+        self.d_vars = [var for var in t_vars if 'd_' in var.name]
+        self.g_vars = [var for var in t_vars if 'g_' in var.name]
+
+        self.saver = tf.train.Saver(max_to_keep=1)
+
+        self.mask = tf.placeholder(tf.float32, self.image_shape, name='mask')
+        self.lowres_mask = tf.placeholder(tf.float32, self.lowres_shape, name='lowres_mask')
+
+        self.contextual_loss = tf.reduce_mean(
+            tf.layers.flatten(tf.abs(tf.multiply(self.mask, self.G) - tf.multiply(self.mask, self.images))), 1
+        )
+        self.contextual_loss += tf.reduce_mean(
+            tf.layers.flatten(tf.abs(tf.multiply(self.lowres_mask, self.lowres_G) - tf.multiply(self.lowres_mask, self.lowres_images))), 1
+        )
+
+        self.perceptual_loss = self.g_loss
+        self.complete_loss = self.contextual_loss + self.lam * self.perceptual_loss
+        self.grad_complete = tf.gradients(self.complete_loss, self.z)
 
     def train(self, config):
-        pass
+        data = dataset_files(config.dataset)
+        np.random.shuffle(data)
+
+        assert len(data) > 0
+
+        d_optim = tf.train.AdamOptimizer(config.learning_rate, beta1=config.beta1).minimize(self.d_loss, var_list=self.d_vars)
+        g_optim = tf.train.AdamOptimizer(config.learning_rate, beta1=config.beta1).minimize(self.g_loss, var_list=self.g_vars)
+
+        try:
+            tf.global_variables_initializer().run()
+        except:
+            tf.initialize_all_variables().run()
+
+        self.g_sum = tf.summary.merge(
+            [self.z_sum, self.d_sum, self.G_sum, self.d_loss_fake_sum, self.g_loss_sum]
+        )
+
+        self.d_sum = tf.summary.merge(
+            [self.z_sum, self.d_sum, self.d_loss_real_sum, self.d_loss_sum]
+        )
+
+        self.writer = tf.summary.FileWriter("./logs", self.sess.graph)
+
+        sample_z = np.random.uniform(-1, 1, size=(self.sample_size, self.z_dim))
+        sample_files = data[0: self.sample_size]
+
+        sample = [get_image(sample_file, self.image_size, is_crop=self.is_crop) for sample_file in sample_files]
+        sample_images = np.array(sample).astype(tf.float32)
+
+        counter = 1
+
+        start_time = time.time()
+
+        if self.load(self.checkpoint_dir):
+            print("""
+            ======
+An existing model was found in the checkpoint directory.
+If you just cloned this repository, it's a model for faces
+trained on the CelebA dataset for 20 epochs.
+If you want to train a new model from scratch,
+delete the checkpoint directory or specify a different
+--checkpoint_dir argument.
+            ======
+
+            """)
+        else:
+            print("""
+            ======
+An existing model was not found in the checkpoint directory.
+Initializing a new one.
+            ======
+            """)
+
+        for epoch in xrange(config.epoch):
+            batch_idx = min(len(data), config.train_size) // self.batch_size
+            for idx in xrange(0, batch_idx):
+                batch_files = data[idx * config.batch_size: (dix+1) * config.batch_size]
+                batch = [get_image(batch_file, self.image_size, is_crop=self.is_crop) for batch_file in batch_files]
+
+                batch_images = np.array(batch).astype(np.float32)
+
+                batch_z = np.random.uniform(-1, 1, [config.batch_size, self.z_dim]).astype(np.float32)
+
+                _, summary_str = self.sess.run(
+                    [d_optim, self.d_sum], feed_dict={self.images: batch_images, self.z: batch_z, self.is_training: True}
+                )
+                self.writer.add_summary(summary_str, counter)
+
+                _. summary_str = self.sess.run(
+                    [g_optim, self.g_sum], feed_dict={self.z: batch_z, self.is_training: True}
+                )
+                self.writer.add_summary(summary_str, counter)
+
+                _.summary_str = self.sess.run(
+                    [g_optim, self.g_sum], feed_dict={self.z: batch_z, self.is_training: True}
+                )
+                self.writer.add_summary(summary_str, counter)
+
+                errD_fake = self.d_loss_fake.eval({self.z: batch_z, self.is_training: False})
+                errD_real = self.d_loss_real.eval({self.images: batch_images, self.is_training: False})
+                errG = self.g_loss.eval({self.z: batch_z, self.is_training: False})
+
+                counter += 1
+
+                print("Epoch: [{:2d}] [{:4d}/{:4d}] time: {:4.4f}, d_loss: {:.8f}, g_loss: {:.8f}".format(
+                    epoch, idx, batch_idx, time.time() - start_time, errD_fake + errD_real, errG))
+
+                if np.mod(counter, 100) == 1:
+                    samples, d_loss, g_loss = self.sess.run(
+                        [self.G, self.d_loss, self.g_loss], feed_dict={self.z: sample_z, self.images: sample_images, self.is_training: False}
+                    )
+                    save_images(samples, [8, 8], './samples/train_{:02d}_{:04d}.png'.format(epoch, idx))
+                    print("[Sample] d_loss: {:.8f}, g_loss: {:.8f}".format(d_loss, g_loss))
+                if np.mod(counter, 500) == 2:
+                    self.save(config.checkpoint_dir, counter)
 
     def complete(self, config):
         def make_dir(name):
@@ -162,6 +321,7 @@ class DCGAN(object):
             for img in range(batchSz):
                 with open(os.path.join(config.outDir, 'logs/hats_{:02d}.log'.format(img)), 'a') as f:
                     f.write('iter loss '+ " ".join(['z{}'.format(zi) for zi in range(self.z_dim)]) + '\n')
+
             for i in xrange(config.nIter):
                 fd = {
                     self.z: zhats,
