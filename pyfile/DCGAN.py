@@ -8,7 +8,7 @@ import tensorflow as tf
 
 from glob import glob
 from six.moves import xrange
-from utils import batch_norm, linear, conv2d_transpose, lrelu, conv2d, get_image
+from utils import batch_norm, linear, conv2d_transpose, lrelu, conv2d, get_image, save_images
 
 
 def conv_out_size_same(size, stride):
@@ -132,6 +132,107 @@ class DCGAN(object):
 
             batch_files = config.imgs[l: u]
             batch = [get_image(batch_file, self.image_size, is_crop=self.is_crop) for batch_file in batch_files]
+
+            batch_images = np.array(batch).astype(tf.float32)
+
+            if batchSz < self.batch_size:
+                print(batchSz)
+                padSz = ((0, int(self.batch_size - batchSz)), (0, 0), (0, 0), (0, 0))
+                batch_images = np.pad(batch_images, padSz, 'constant')
+                batch_images = batch_images.astype(tf.float32)
+
+            z_hats = np.random.uniform(-1, 1, size=(self.batch_size, self.z_dim))
+            m = 0
+            v = 0
+
+            nRows = np.ceil(batchSz / 8)
+            nCols = min(8, batchSz)
+
+            save_images(batch_images[:batchSz, :, :, :], [nRows, nCols], os.path.join(config.outDir, 'before.png'))
+            masked_images = np.multiply(batch_images, mask)
+            save_images(masked_images[:batchSz, :, :, :], [nRows, nCols], os.path.join(config.outDir, 'masked_png'))
+
+            if lowres_mask.any():
+                lowres_images = np.reshape(batch_images, [self.batch_sizem, self.lowres_size, self.lowres,
+                                                          self.lowres_size, self.lowres, self.c_dim]).mean(4).mean(2)
+                lowres_images = np.multiply(lowres_images, lowres_mask)
+                lowres_images = np.repeat(np.repeat(lowres_images, self.lowres, 1), self.lowres, 2)
+
+                save_images(lowres_images[:batchSz, :, :, :], [nRows, nCols], os.path.join(config.outDir, 'lowres.png'))
+            for img in range(batchSz):
+                with open(os.path.join(config.outDir, 'logs/hats_{:02d}.log'.format(img)), 'a') as f:
+                    f.write('iter loss '+ " ".join(['z{}'.format(zi) for zi in range(self.z_dim)]) + '\n')
+            for i in xrange(config.nIter):
+                fd = {
+                    self.z: zhats,
+                    self.mask: mask,
+                    self.lowres_mask: lowres_mask,
+                    self.images: batch_images,
+                    self.is_training: False
+                }
+                run = [self.complete_loss, self.grad_complete_loss, self.G, self.lowres_G]
+                loss, g, G_imgs, lowres_G_imgs = self.sess.run(run, feed_dict=fd)
+
+                for img in range(batchSz):
+                    with open(os.path.join(config.outDir, 'logs/hats_{:02d}.log'.format(img)), 'ab') as f:
+                        f.write('{} {} '.format(i, loss[img]).encode())
+                        np.savetxt(f, zhats[img:img + 1])
+
+                if i % config.outInterval == 0:
+                    print(i, np.mean(loss[0:batchSz]))
+                    imgName = os.path.join(config.outDir,
+                                           'hats_imgs/{:04d}.png'.format(i))
+                    nRows = np.ceil(batchSz / 8)
+                    nCols = min(8, batchSz)
+                    save_images(G_imgs[:batchSz, :, :, :], [nRows, nCols], imgName)
+                    if lowres_mask.any():
+                        imgName = imgName[:-4] + '.lowres.png'
+                        save_images(np.repeat(np.repeat(lowres_G_imgs[:batchSz, :, :, :],
+                                                        self.lowres, 1), self.lowres, 2),
+                                    [nRows, nCols], imgName)
+
+                    inv_masked_hat_images = np.multiply(G_imgs, 1.0 - mask)
+                    completed = masked_images + inv_masked_hat_images
+                    imgName = os.path.join(config.outDir,
+                                           'completed/{:04d}.png'.format(i))
+                    save_images(completed[:batchSz, :, :, :], [nRows, nCols], imgName)
+
+                if config.approach == 'adam':
+                    # Optimize single completion with Adam
+                    m_prev = np.copy(m)
+                    v_prev = np.copy(v)
+                    m = config.beta1 * m_prev + (1 - config.beta1) * g[0]
+                    v = config.beta2 * v_prev + (1 - config.beta2) * np.multiply(g[0], g[0])
+                    m_hat = m / (1 - config.beta1 ** (i + 1))
+                    v_hat = v / (1 - config.beta2 ** (i + 1))
+                    zhats += - np.true_divide(config.lr * m_hat, (np.sqrt(v_hat) + config.eps))
+                    zhats = np.clip(zhats, -1, 1)
+
+                elif config.approach == 'hmc':
+                    # Sample example completions with HMC (not in paper)
+                    zhats_old = np.copy(zhats)
+                    loss_old = np.copy(loss)
+                    v = np.random.randn(self.batch_size, self.z_dim)
+                    v_old = np.copy(v)
+
+                    for steps in range(config.hmcL):
+                        v -= config.hmcEps / 2 * config.hmcBeta * g[0]
+                        zhats += config.hmcEps * v
+                        np.copyto(zhats, np.clip(zhats, -1, 1))
+                        loss, g, _, _ = self.sess.run(run, feed_dict=fd)
+                        v -= config.hmcEps / 2 * config.hmcBeta * g[0]
+
+                    for img in range(batchSz):
+                        logprob_old = config.hmcBeta * loss_old[img] + np.sum(v_old[img] ** 2) / 2
+                        logprob = config.hmcBeta * loss[img] + np.sum(v[img] ** 2) / 2
+                        accept = np.exp(logprob_old - logprob)
+                        if accept < 1 and np.random.uniform() > accept:
+                            np.copyto(zhats[img], zhats_old[img])
+
+                    config.hmcBeta *= config.hmcAnneal
+
+                else:
+                    assert (False)
 
     def discriminator(self, image, reuse=False):
         with tf.variable_scope('discriminator') as scope:
